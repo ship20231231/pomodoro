@@ -1,0 +1,1492 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>番茄鐘</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #D6DFD7; }
+  #root { min-height: 100%; }
+</style>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js" crossorigin></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useCallback, useEffect, useMemo, useRef, useState } = React;
+
+// 原本的版本跑在 Claude 的畫布裡，用的是那裡才有的 window.storage。
+// 瀏覽器沒有這個東西，所以在這裡用瀏覽器內建的 localStorage 補上同名的三個方法，
+// 底下的程式碼就完全不必改寫。資料只留在這台電腦的這個瀏覽器裡。
+const storage = {
+  async get(key) {
+    const value = localStorage.getItem(key);
+    if (value === null) throw new Error("查無此紀錄：" + key);
+    return { key, value, shared: false };
+  },
+  async set(key, value) {
+    localStorage.setItem(key, value);
+    return { key, value, shared: false };
+  },
+  async delete(key) {
+    localStorage.removeItem(key);
+    return { key, deleted: true, shared: false };
+  },
+};
+window.storage = storage;
+
+const KEY = "pomodoro:data";
+const SOUND_KEY = "pomodoro:sound";
+const DEFAULTS = { focus: 25, short: 5, long: 15, cycle: 4, repeat: false };
+const WD = ["一", "二", "三", "四", "五", "六", "日"];
+const LABEL = { focus: "專注", short: "短休息", long: "長休息" };
+const ORDER = ["focus", "short", "long"];
+
+const css = `
+@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;500;600;700&display=swap');
+.pom {
+  --field:#D6DFD7; --enamel:#F4F6F1; --ink:#1E2A25; --muted:#5A6A62;
+  --signal:#BE3A2B; --brass:#9C7F3E; --line:#B9C6BB; --bezel:#2C3A34;
+  --sans:"Noto Serif TC","Source Han Serif TC","Songti TC","Noto Serif CJK TC",Georgia,serif;
+  --serif:"Noto Serif TC","Source Han Serif TC","Songti TC",Georgia,serif;
+  background:var(--field); color:var(--ink); font-family:var(--sans); font-weight:500;
+  min-height:100%; padding:28px 20px 40px; box-sizing:border-box;
+  -webkit-font-smoothing:antialiased;
+}
+.pom *,.pom *::before,.pom *::after{box-sizing:border-box;}
+.pom-wrap{max-width:880px;margin:0 auto;}
+.pom-head{display:flex;align-items:baseline;justify-content:space-between;gap:16px;
+  border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:26px;}
+.pom-title{font-family:var(--serif);font-size:27px;font-weight:700;letter-spacing:.08em;margin:0;}
+.pom-note{font-size:12.5px;color:var(--muted);line-height:1.5;}
+.pom-cols{display:grid;grid-template-columns:1fr;gap:34px;}
+@media (min-width:760px){.pom-cols{grid-template-columns:1.05fr .95fr;gap:44px;}}
+
+.pom-modes{display:flex;gap:22px;justify-content:center;margin-bottom:20px;}
+.pom-mode{background:none;border:0;padding:4px 0 6px;font-family:var(--sans);font-size:14px;
+  color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;line-height:1.3;}
+.pom-mode span{display:block;font-family:var(--serif);font-size:12px;margin-top:2px;}
+.pom-mode.on{color:var(--ink);border-bottom-color:var(--signal);}
+.pom-mode:focus-visible,.pom-btn:focus-visible,.pom-link:focus-visible,.pom input:focus-visible{
+  outline:2px solid var(--brass);outline-offset:2px;}
+
+.pom-dial{display:block;margin:0 auto;width:100%;max-width:290px;height:auto;}
+.pom-time{font-family:var(--serif);font-size:45px;font-weight:600;letter-spacing:.02em;}
+.pom-sub{font-family:var(--sans);font-size:11.5px;font-weight:500;fill:var(--muted);}
+
+.pom-task{display:block;width:100%;margin:22px auto 18px;max-width:340px;background:transparent;
+  border:0;border-bottom:1px solid var(--line);padding:7px 2px;font-family:var(--sans);
+  font-size:15px;color:var(--ink);text-align:center;}
+.pom-task::placeholder{color:var(--muted);opacity:.75;}
+.pom-task:focus{outline:none;border-bottom-color:var(--brass);}
+
+.pom-acts{display:flex;gap:10px;justify-content:center;}
+.pom-btn{font-family:var(--sans);font-size:14px;font-weight:600;padding:10px 26px;border-radius:2px;
+  cursor:pointer;border:1px solid var(--ink);background:transparent;color:var(--ink);}
+.pom-btn.solid{background:var(--ink);color:var(--enamel);}
+.pom-btn.ring{border-color:var(--signal);background:var(--signal);color:#FBFCFA;}
+.pom-btn:disabled{opacity:.35;cursor:default;}
+.pom-file{display:inline-block;font-family:var(--sans);font-size:13.5px;font-weight:600;
+  padding:8px 18px;border:1px solid var(--ink);border-radius:2px;cursor:pointer;}
+.pom-file input{position:absolute;width:1px;height:1px;opacity:0;}
+.pom-sound{font-size:12.5px;color:var(--muted);line-height:1.7;margin:10px 0 0;}
+.pom-check{display:flex;align-items:center;gap:8px;font-size:13px;margin-top:12px;cursor:pointer;}
+.pom-check input{width:15px;height:15px;accent-color:var(--signal);}
+.pom-rest{max-width:340px;margin:22px auto 18px;text-align:center;font-size:13.5px;
+  color:var(--muted);line-height:1.7;padding:7px 2px;border-bottom:1px solid var(--line);}
+
+.pom-panel{background:var(--enamel);border:1px solid var(--line);border-radius:2px;padding:18px 18px 16px;}
+.pom-h{font-size:13.5px;font-weight:700;letter-spacing:.08em;margin:0 0 12px;}
+.pom-stat{font-family:var(--serif);font-size:15px;line-height:1.9;margin:0 0 14px;}
+.pom-stat b{font-size:27px;font-weight:600;padding:0 4px;}
+
+.pom-week{display:flex;gap:8px;align-items:flex-end;height:66px;margin-bottom:6px;}
+.pom-day{flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%;}
+.pom-bar{background:var(--signal);opacity:.85;min-height:2px;border-radius:1px 1px 0 0;}
+.pom-bar.zero{background:var(--line);opacity:1;}
+.pom-daylabel{font-size:10.5px;color:var(--muted);text-align:center;margin-top:5px;}
+
+.pom-log{list-style:none;margin:0;padding:0;}
+.pom-scroll{max-height:440px;overflow-y:auto;padding-right:4px;}
+.pom-log li{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--line);font-size:13.5px;}
+.pom-log li:last-child{border-bottom:0;}
+.pom-when{font-family:var(--serif);color:var(--muted);width:46px;flex:none;}
+.pom-what{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.pom-dot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--signal);}
+.pom-dot.rest{background:var(--line);}
+.pom-mins{font-family:var(--serif);color:var(--muted);flex:none;}
+.pom-date{font-size:11.5px;color:var(--muted);margin:14px 0 2px;}
+.pom-empty{font-size:13px;color:var(--muted);line-height:1.7;margin:0;}
+
+.pom-foot{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:14px;}
+.pom-link{background:none;border:0;padding:2px 0;font-family:var(--sans);font-size:12.5px;
+  color:var(--muted);cursor:pointer;text-decoration:underline;text-underline-offset:3px;}
+.pom-set{display:grid;grid-template-columns:repeat(2,1fr);gap:12px 16px;margin-top:2px;}
+.pom-set label{font-size:12.5px;color:var(--muted);display:block;margin-bottom:4px;}
+.pom-set input{width:100%;background:#FBFCFA;border:1px solid var(--line);border-radius:2px;
+  padding:7px 9px;font-family:var(--serif);font-size:15px;font-weight:600;color:var(--ink);}
+.pom-warn{font-size:12.5px;color:var(--signal);margin:10px 0 0;}
+.pom-out{width:100%;height:190px;resize:vertical;background:#FBFCFA;border:1px solid var(--line);
+  border-radius:2px;padding:9px 10px;font-family:var(--serif);font-size:12.5px;line-height:1.6;
+  color:var(--ink);white-space:pre;overflow:auto;}
+.pom-out:focus{outline:2px solid var(--brass);outline-offset:1px;}
+
+.pom-seg{display:flex;gap:18px;margin:0 0 14px;}
+.pom-tab{background:none;border:0;padding:3px 0 5px;font-family:var(--sans);font-size:13.5px;
+  font-weight:600;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;}
+.pom-tab.on{color:var(--ink);border-bottom-color:var(--signal);}
+.pom-tab:focus-visible{outline:2px solid var(--brass);outline-offset:2px;}
+.pom-nav{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px;}
+.pom-navlabel{font-size:12.5px;font-weight:600;}
+.pom-wk{display:flex;gap:8px;align-items:flex-end;height:118px;}
+.pom-wklab{display:flex;gap:8px;margin-top:6px;}
+.pom-wklab div{flex:1;text-align:center;font-size:10.5px;color:var(--muted);line-height:1.6;}
+.pom-wklab b{display:block;font-family:var(--serif);font-size:11px;font-weight:600;color:var(--ink);}
+.pom-cal{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;}
+.pom-calhead{font-size:10.5px;color:var(--muted);text-align:center;padding-bottom:3px;}
+.pom-cell{aspect-ratio:1;border:1px solid var(--line);border-radius:2px;font-size:10.5px;
+  font-family:var(--serif);color:var(--muted);display:flex;align-items:center;justify-content:center;}
+.pom-cell.hit{border-color:transparent;color:#FBFCFA;font-weight:600;}
+.pom-cell.blank{border-color:transparent;}
+.pom-row{display:flex;align-items:center;gap:10px;font-size:12.5px;padding:5px 0;}
+.pom-rowname{width:88px;flex:none;color:var(--muted);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;}
+.pom-rowbar{flex:1;height:9px;background:var(--line);border-radius:1px;overflow:hidden;}
+.pom-rowbar i{display:block;height:100%;background:var(--signal);opacity:.85;}
+.pom-rowval{width:60px;flex:none;text-align:right;font-family:var(--serif);color:var(--muted);}
+`;
+
+function arc(cx, cy, r, frac) {
+  if (frac <= 0) return "";
+  const f = Math.min(frac, 0.99999);
+  const a = f * Math.PI * 2;
+  const x = cx + r * Math.sin(a);
+  const y = cy - r * Math.cos(a);
+  return `M ${cx} ${cy} L ${cx} ${cy - r} A ${r} ${r} 0 ${a > Math.PI ? 1 : 0} 1 ${x} ${y} Z`;
+}
+
+function mmss(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function dayDate(ts) {
+  const d = new Date(ts);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function keyOf(d) {
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+}
+
+function dayKey(ts) {
+  return keyOf(dayDate(ts));
+}
+
+function clock(ts) {
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function toCSV(list) {
+  const esc = (v) => {
+    const s = String(v == null ? "" : v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const rows = list
+    .slice()
+    .sort((a, b) => a.at - b.at)
+    .map((r) => {
+      const d = new Date(r.at);
+      const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+        d.getDate()
+      ).padStart(2, "0")}`;
+      return [date, clock(r.at), LABEL[r.mode] || r.mode, r.task || LABEL[r.mode] || "", r.minutes || 0]
+        .map(esc)
+        .join(",");
+    });
+  return ["日期,時間,類型,任務,分鐘", ...rows].join("\n");
+}
+
+const MODE_OF = {
+  專注: "focus",
+  短休息: "short",
+  長休息: "long",
+  focus: "focus",
+  short: "short",
+  long: "long",
+};
+
+function parseCSV(text) {
+  const s = String(text || "")
+    .replace(/^\ufeff/, "")
+    .replace(/\r\n?/g, "\n");
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let quoted = false;
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s[i];
+    if (quoted) {
+      if (c === '"') {
+        if (s[i + 1] === '"') {
+          cell += '"';
+          i += 1;
+        } else quoted = false;
+      } else cell += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (c === "\n") {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else cell += c;
+  }
+  if (cell !== "" || row.length) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows.filter((r) => r.some((v) => String(v).trim() !== ""));
+}
+
+function parseImport(text) {
+  const rows = parseCSV(text);
+  if (!rows.length) return { records: [], skipped: 0 };
+  const head = rows[0].map((v) => String(v).trim());
+  const start = head[0] === "日期" || head[0].toLowerCase() === "date" ? 1 : 0;
+  const records = [];
+  let skipped = 0;
+  for (let i = start; i < rows.length; i += 1) {
+    const cells = rows[i].map((v) => String(v).trim());
+    const mode = MODE_OF[cells[2]];
+    const dm = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(cells[0] || "");
+    const tm = /^(\d{1,2}):(\d{2})$/.exec(cells[1] || "");
+    const minutes = Number(cells[4]);
+    if (!mode || !dm || !tm || !Number.isFinite(minutes) || minutes <= 0) {
+      skipped += 1;
+      continue;
+    }
+    const at = new Date(
+      Number(dm[1]),
+      Number(dm[2]) - 1,
+      Number(dm[3]),
+      Number(tm[1]),
+      Number(tm[2]),
+      0,
+      0
+    ).getTime();
+    const name = cells[3] || "";
+    records.push({
+      id: `imp-${at}-${mode}`,
+      mode,
+      task: mode === "focus" && name !== LABEL.focus ? name : "",
+      minutes: Math.round(minutes),
+      at,
+    });
+  }
+  return { records, skipped };
+}
+
+function groupLog(list) {
+  const g = [];
+  list.forEach((r) => {
+    const k = dayKey(r.at);
+    const last = g[g.length - 1];
+    if (last && last.key === k) last.rows.push(r);
+    else g.push({ key: k, at: r.at, rows: [r] });
+  });
+  return g;
+}
+
+function fmtKey(k) {
+  const p = String(k || "").split("-");
+  return p.length === 3 ? `${p[1]} 月 ${p[2]} 日` : "";
+}
+
+function focusSinceLong(list) {
+  let n = 0;
+  for (const r of list) {
+    if (r.mode === "long") break;
+    if (r.mode === "focus") n += 1;
+  }
+  return n;
+}
+
+function chime() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const t0 = ctx.currentTime;
+    [880, 660].forEach((hz, i) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      const t = t0 + i * 0.3;
+      o.type = "triangle";
+      o.frequency.value = hz;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.22, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
+      o.connect(g);
+      g.connect(ctx.destination);
+      o.start(t);
+      o.stop(t + 0.28);
+    });
+    setTimeout(() => ctx.close(), 1200);
+  } catch (e) {
+    /* 靜音環境下略過 */
+  }
+}
+
+function Pomodoro() {
+  const [ready, setReady] = useState(false);
+  const [failed, setFailed] = useState("");
+  const [settings, setSettings] = useState(DEFAULTS);
+  const [log, setLog] = useState([]);
+  const [mode, setMode] = useState("focus");
+  const [task, setTask] = useState("");
+  const [running, setRunning] = useState(false);
+  const [endsAt, setEndsAt] = useState(null);
+  const [remaining, setRemaining] = useState(DEFAULTS.focus * 60);
+  const [panel, setPanel] = useState("log");
+  const [confirming, setConfirming] = useState(false);
+  const [hint, setHint] = useState("");
+  const [repView, setRepView] = useState("week");
+  const [offset, setOffset] = useState(0);
+  const [impText, setImpText] = useState("");
+  const [impParsed, setImpParsed] = useState(null);
+  const [impNote, setImpNote] = useState("");
+  const [impConfirm, setImpConfirm] = useState(false);
+  const [sound, setSound] = useState(null);
+  const [soundNote, setSoundNote] = useState("");
+  const [ringing, setRinging] = useState(false);
+  const ringRef = useRef(null);
+
+  const leftRef = useRef(remaining);
+  leftRef.current = remaining;
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      let data = null;
+      try {
+        const res = await window.storage.get(KEY);
+        if (res && res.value) data = JSON.parse(res.value);
+      } catch (e) {
+        data = null;
+      }
+      if (!alive) return;
+      const s = { ...DEFAULTS, ...((data && data.settings) || {}) };
+      const raw = data && Array.isArray(data.log) ? data.log : [];
+      const list = raw.map((r) => (r && r.mode !== "focus" && r.task ? { ...r, task: "" } : r));
+      setSettings(s);
+      const t = data && data.timer;
+      if (t && ORDER.includes(t.mode)) {
+        setTask(typeof t.task === "string" ? t.task : "");
+        const left = t.running && t.endsAt ? Math.round((t.endsAt - Date.now()) / 1000) : null;
+        if (left !== null && left > 0) {
+          setLog(list);
+          setMode(t.mode);
+          setEndsAt(t.endsAt);
+          setRunning(true);
+          setRemaining(left);
+        } else if (left !== null) {
+          const rec = {
+            id: String(t.endsAt),
+            mode: t.mode,
+            task: t.mode === "focus" ? (t.task || "").trim() : "",
+            minutes: s[t.mode],
+            at: t.endsAt,
+          };
+          const merged = [rec, ...list];
+          const next =
+            t.mode === "focus"
+              ? focusSinceLong(merged) % s.cycle === 0
+                ? "long"
+                : "short"
+              : "focus";
+          setLog(merged);
+          setMode(next);
+          setRemaining(s[next] * 60);
+        } else {
+          setLog(list);
+          setMode(t.mode);
+          setRemaining(
+            typeof t.remaining === "number" && t.remaining > 0 ? t.remaining : s[t.mode] * 60
+          );
+        }
+      } else {
+        setLog(list);
+        setRemaining(s.focus * 60);
+      }
+      setReady(true);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return undefined;
+    let alive = true;
+    (async () => {
+      try {
+        await window.storage.set(
+          KEY,
+          JSON.stringify({
+            settings,
+            log: log.slice(0, 400),
+            timer: { mode, task, running, endsAt, remaining: leftRef.current },
+          })
+        );
+        if (alive) setFailed("");
+      } catch (e) {
+        if (alive) setFailed("紀錄沒有存進瀏覽器，可能是瀏覽器的儲存空間滿了。");
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [ready, settings, log, mode, task, running, endsAt]);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await window.storage.get(SOUND_KEY);
+        if (!alive || !res || !res.value) return;
+        const s = JSON.parse(res.value);
+        if (s && s.data) setSound({ name: s.name || "自訂音檔", data: s.data });
+      } catch (e) {
+        /* 還沒設定過音檔 */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const stopRing = useCallback(() => {
+    const a = ringRef.current;
+    if (a) {
+      try {
+        a.pause();
+        a.currentTime = 0;
+      } catch (e) {
+        /* 部分瀏覽器在未載入時會擋下 */
+      }
+    }
+    setRinging(false);
+  }, []);
+
+  const playAlert = useCallback(() => {
+    const a = ringRef.current;
+    if (!sound || !a) {
+      chime();
+      return;
+    }
+    try {
+      a.src = sound.data;
+      a.loop = !!settings.repeat;
+      a.currentTime = 0;
+      setRinging(true);
+      const p = a.play();
+      if (p && typeof p.catch === "function") {
+        p.catch(() => {
+          setRinging(false);
+          chime();
+        });
+      }
+    } catch (e) {
+      setRinging(false);
+      chime();
+    }
+  }, [sound, settings.repeat]);
+
+  const onPickFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const data = String(reader.result || "");
+      const oversize = data.length > 1200000;
+      setSound({ name: file.name, data });
+      if (oversize) {
+        setSoundNote(
+          "這個檔案太大，只能在這次開啟期間使用。重新整理之後要再選一次，或改用十秒以內的短音效。"
+        );
+        return;
+      }
+      try {
+        await window.storage.set(SOUND_KEY, JSON.stringify({ name: file.name, data }));
+        setSoundNote("已存在這個瀏覽器裡，下次打開還是同一個聲音。");
+      } catch (err) {
+        setSoundNote("音檔沒能存進瀏覽器，這次開啟期間仍然可以用。");
+      }
+    };
+    reader.onerror = () => setSoundNote("檔案讀不出來，換一個檔案再試。");
+    reader.readAsDataURL(file);
+  };
+
+  const clearSound = async () => {
+    stopRing();
+    setSound(null);
+    setSoundNote("已改回內建的提示音。");
+    try {
+      await window.storage.delete(SOUND_KEY);
+    } catch (e) {
+      /* 本來就沒有紀錄 */
+    }
+  };
+
+  const finish = useCallback(() => {
+    const rec = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      mode,
+      task: mode === "focus" ? task.trim() : "",
+      minutes: settings[mode],
+      at: Date.now(),
+    };
+    const merged = [rec, ...log];
+    const next =
+      mode === "focus"
+        ? focusSinceLong(merged) % settings.cycle === 0
+          ? "long"
+          : "short"
+        : "focus";
+    setLog(merged);
+    setRunning(false);
+    setEndsAt(null);
+    setMode(next);
+    setRemaining(settings[next] * 60);
+    playAlert();
+  }, [mode, task, settings, log, playAlert]);
+
+  useEffect(() => {
+    if (!running || !endsAt) return undefined;
+    const tick = () => {
+      const left = (endsAt - Date.now()) / 1000;
+      if (left <= 0) finish();
+      else setRemaining(left);
+    };
+    tick();
+    const id = setInterval(tick, 250);
+    return () => clearInterval(id);
+  }, [running, endsAt, finish]);
+
+  const total = settings[mode] * 60;
+  const frac = total > 0 ? Math.max(0, Math.min(1, remaining / total)) : 0;
+
+
+  const byDay = useMemo(() => {
+    const m = new Map();
+    log.forEach((r) => {
+      if (r.mode !== "focus") return;
+      const k = dayKey(r.at);
+      const cur = m.get(k) || { minutes: 0, count: 0 };
+      cur.minutes += r.minutes || 0;
+      cur.count += 1;
+      m.set(k, cur);
+    });
+    return m;
+  }, [log]);
+
+  const today = useMemo(() => {
+    const v = byDay.get(dayKey(Date.now()));
+    return { count: v ? v.count : 0, minutes: v ? v.minutes : 0 };
+  }, [byDay]);
+
+  const week = useMemo(() => {
+    const out = [];
+    const base = dayDate(Date.now());
+    for (let i = 6; i >= 0; i -= 1) {
+      const d = new Date(base);
+      d.setDate(base.getDate() - i);
+      const v = byDay.get(keyOf(d));
+      out.push({ label: `${d.getMonth() + 1}/${d.getDate()}`, minutes: v ? v.minutes : 0 });
+    }
+    return out;
+  }, [byDay]);
+
+  const weekReport = useMemo(() => {
+    const build = (offset) => {
+      const base = dayDate(Date.now() - offset * 604800000);
+      const start = new Date(base);
+      start.setDate(base.getDate() - ((base.getDay() + 6) % 7));
+      const days = [];
+      let minutes = 0;
+      let count = 0;
+      for (let i = 0; i < 7; i += 1) {
+        const d = new Date(start);
+        d.setDate(start.getDate() + i);
+        const v = byDay.get(keyOf(d)) || { minutes: 0, count: 0 };
+        minutes += v.minutes;
+        count += v.count;
+        days.push({ d, minutes: v.minutes, count: v.count, future: d > base });
+      }
+      const end = new Date(start);
+      end.setDate(start.getDate() + 6);
+      return {
+        days,
+        minutes,
+        count,
+        label: `${start.getMonth() + 1} 月 ${start.getDate()} 日至 ${
+          end.getMonth() + 1
+        } 月 ${end.getDate()} 日`,
+      };
+    };
+    return { build };
+  }, [byDay]);
+
+  const monthReport = useMemo(() => {
+    const build = (offset) => {
+      const base = dayDate(Date.now());
+      const first = new Date(base.getFullYear(), base.getMonth() - offset, 1);
+      const total = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+      const pad = (first.getDay() + 6) % 7;
+      const cells = [];
+      let minutes = 0;
+      let count = 0;
+      let active = 0;
+      for (let i = 0; i < pad; i += 1) cells.push(null);
+      for (let i = 1; i <= total; i += 1) {
+        const d = new Date(first.getFullYear(), first.getMonth(), i);
+        const v = byDay.get(keyOf(d)) || { minutes: 0, count: 0 };
+        minutes += v.minutes;
+        count += v.count;
+        if (v.count) active += 1;
+        cells.push({ day: i, minutes: v.minutes, count: v.count, future: d > base });
+      }
+      return {
+        cells,
+        minutes,
+        count,
+        active,
+        label: `${first.getFullYear()} 年 ${first.getMonth() + 1} 月`,
+      };
+    };
+    return { build };
+  }, [byDay]);
+
+  const allReport = useMemo(() => {
+    const focus = log.filter((r) => r.mode === "focus");
+    const months = new Map();
+    const tasks = new Map();
+    focus.forEach((r) => {
+      const d = new Date(r.at);
+      const mk = `${d.getFullYear()}-${d.getMonth()}`;
+      const mv =
+        months.get(mk) || {
+          minutes: 0,
+          count: 0,
+          sort: d.getFullYear() * 12 + d.getMonth(),
+          label: `${d.getFullYear()} 年 ${d.getMonth() + 1} 月`,
+        };
+      mv.minutes += r.minutes || 0;
+      mv.count += 1;
+      months.set(mk, mv);
+      const name = (r.task || "").trim() || "未命名";
+      const tv = tasks.get(name) || { minutes: 0, count: 0 };
+      tv.minutes += r.minutes || 0;
+      tv.count += 1;
+      tasks.set(name, tv);
+    });
+    let bestKey = null;
+    let bestMin = 0;
+    byDay.forEach((v, k) => {
+      if (v.minutes > bestMin) {
+        bestMin = v.minutes;
+        bestKey = k;
+      }
+    });
+    const times = focus.map((r) => r.at);
+    return {
+      count: focus.length,
+      minutes: focus.reduce((a, r) => a + (r.minutes || 0), 0),
+      activeDays: byDay.size,
+      months: Array.from(months.values()).sort((a, b) => a.sort - b.sort),
+      tasks: Array.from(tasks.entries())
+        .map(([name, v]) => ({ name, ...v }))
+        .sort((a, b) => b.minutes - a.minutes),
+      bestKey,
+      bestMin,
+      first: times.length ? Math.min(...times) : null,
+    };
+  }, [log, byDay]);
+
+  const peak = Math.max(60, ...week.map((d) => d.minutes));
+
+  const rep =
+    repView === "week"
+      ? weekReport.build(offset)
+      : repView === "month"
+      ? monthReport.build(offset)
+      : null;
+  const repPrev =
+    repView === "week"
+      ? weekReport.build(offset + 1)
+      : repView === "month"
+      ? monthReport.build(offset + 1)
+      : null;
+  const repPeak =
+    repView === "week" && rep
+      ? Math.max(30, ...rep.days.map((d) => d.minutes))
+      : repView === "month" && rep
+      ? Math.max(30, ...rep.cells.filter(Boolean).map((c) => c.minutes))
+      : 30;
+  const diff = rep && repPrev ? rep.minutes - repPrev.minutes : 0;
+  const diffWord = diff === 0 ? "持平" : diff > 0 ? `多了 ${diff} 分鐘` : `少了 ${-diff} 分鐘`;
+
+  const recent = useMemo(() => groupLog(log.slice(0, 12)), [log]);
+  const fullLog = useMemo(() => groupLog(log.slice(0, 200)), [log]);
+
+  const csv = useMemo(() => toCSV(log), [log]);
+
+  const download = () => {
+    try {
+      const blob = new Blob([`\ufeff${csv}`], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `蕃茄鐘紀錄-${dayKey(Date.now())}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      setHint("檔案已送出，請看瀏覽器的下載項目。");
+    } catch (e) {
+      setHint("這個環境擋下了下載，改用複製按鈕。");
+    }
+  };
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(csv);
+      setHint("內容已複製到剪貼簿。");
+    } catch (e) {
+      setHint("複製被擋下，在文字框裡全選再手動複製。");
+    }
+  };
+
+  const readImport = (text) => {
+    setImpText(text);
+    setImpConfirm(false);
+    if (!text.trim()) {
+      setImpParsed(null);
+      setImpNote("");
+      return;
+    }
+    const out = parseImport(text);
+    setImpParsed(out);
+    if (out.records.length === 0) {
+      setImpNote("沒有辨識出任何紀錄，請確認欄位順序是日期、時間、類型、任務、分鐘。");
+    } else {
+      const seen = new Set(log.map((r) => `${r.at}-${r.mode}`));
+      const fresh = out.records.filter((r) => !seen.has(`${r.at}-${r.mode}`)).length;
+      setImpNote(
+        `讀到 ${out.records.length} 筆，其中 ${fresh} 筆是現在沒有的。` +
+          (out.skipped ? `另有 ${out.skipped} 行無法辨識，會略過。` : "")
+      );
+    }
+  };
+
+  const onPickCSV = (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => readImport(String(reader.result || ""));
+    reader.onerror = () => setImpNote("檔案讀不出來，換一個檔案再試。");
+    reader.readAsText(file, "utf-8");
+  };
+
+  const applyImport = (replace) => {
+    if (!impParsed || impParsed.records.length === 0) return;
+    let next;
+    if (replace) {
+      next = impParsed.records.slice();
+    } else {
+      const seen = new Set(log.map((r) => `${r.at}-${r.mode}`));
+      next = log.concat(impParsed.records.filter((r) => !seen.has(`${r.at}-${r.mode}`)));
+    }
+    next.sort((a, b) => b.at - a.at);
+    const kept = next.slice(0, 400);
+    setLog(kept);
+    setImpText("");
+    setImpParsed(null);
+    setImpConfirm(false);
+    setImpNote(
+      replace
+        ? `已用匯入的 ${kept.length} 筆取代原本的紀錄。`
+        : `已合併，現在共 ${kept.length} 筆。`
+    );
+  };
+
+  const pick = (m) => {
+    setMode(m);
+    setRunning(false);
+    setEndsAt(null);
+    setRemaining(settings[m] * 60);
+  };
+
+  const start = () => {
+    setEndsAt(Date.now() + Math.max(1, remaining) * 1000);
+    setRunning(true);
+  };
+
+  const pause = () => {
+    setRemaining(Math.max(0, (endsAt - Date.now()) / 1000));
+    setEndsAt(null);
+    setRunning(false);
+  };
+
+  const ticks = Math.max(5, Math.min(90, settings[mode]));
+
+  return (
+    <div className="pom">
+      <style>{css}</style>
+      <div className="pom-wrap">
+        <div className="pom-head">
+          <h1 className="pom-title">蕃茄鐘</h1>
+          <p className="pom-note">紀錄存在你的 Claude 帳號裡，換手機或電腦打開都是同一份。</p>
+        </div>
+
+        <div className="pom-cols">
+          <div>
+            <div className="pom-modes">
+              {ORDER.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  className={`pom-mode${m === mode ? " on" : ""}`}
+                  onClick={() => pick(m)}
+                >
+                  {LABEL[m]}
+                  <span>{settings[m]} 分</span>
+                </button>
+              ))}
+            </div>
+
+            <svg className="pom-dial" viewBox="0 0 240 240" role="img" aria-label={`剩餘 ${mmss(remaining)}`}>
+              <circle cx="120" cy="120" r="113" fill="var(--bezel)" />
+              <circle cx="120" cy="120" r="104" fill="var(--enamel)" />
+              <path d={arc(120, 120, 92, frac)} fill="var(--signal)" opacity="0.88" />
+              <circle cx="120" cy="120" r="92" fill="none" stroke="var(--brass)" strokeWidth="1" />
+              {Array.from({ length: ticks }).map((_, i) => {
+                const a = (i / ticks) * Math.PI * 2;
+                const long = i % 5 === 0;
+                const r1 = long ? 93 : 97;
+                return (
+                  <line
+                    key={i}
+                    x1={120 + r1 * Math.sin(a)}
+                    y1={120 - r1 * Math.cos(a)}
+                    x2={120 + 102 * Math.sin(a)}
+                    y2={120 - 102 * Math.cos(a)}
+                    stroke="var(--ink)"
+                    strokeWidth={long ? 1.6 : 0.8}
+                    opacity={long ? 0.75 : 0.4}
+                  />
+                );
+              })}
+              <circle cx="120" cy="120" r="62" fill="var(--enamel)" />
+              <text x="120" y="118" textAnchor="middle" className="pom-time" fill="var(--ink)">
+                {mmss(remaining)}
+              </text>
+              <text x="120" y="140" textAnchor="middle" className="pom-sub">
+                {LABEL[mode]}
+                {running ? " 進行中" : ""}
+              </text>
+            </svg>
+
+            {mode === "focus" ? (
+              <input
+                className="pom-task"
+                value={task}
+                onChange={(e) => setTask(e.target.value)}
+                placeholder="這一輪要寫什麼"
+                maxLength={60}
+              />
+            ) : (
+              <p className="pom-rest">
+                休息時間
+                {task.trim() ? `，結束後回到「${task.trim()}」` : ""}
+              </p>
+            )}
+
+            <div className="pom-acts">
+              {ringing ? (
+                <button type="button" className="pom-btn ring" onClick={stopRing}>
+                  停止提示音
+                </button>
+              ) : null}
+              {running ? (
+                <button type="button" className="pom-btn solid" onClick={pause}>
+                  暫停
+                </button>
+              ) : (
+                <button type="button" className="pom-btn solid" onClick={start}>
+                  {remaining < total ? "繼續" : "開始"}
+                </button>
+              )}
+              <button
+                type="button"
+                className="pom-btn"
+                onClick={() => {
+                  setRunning(false);
+                  setEndsAt(null);
+                  setRemaining(total);
+                }}
+                disabled={!running && remaining >= total}
+              >
+                重設
+              </button>
+            </div>
+            {failed ? <p className="pom-warn">{failed}</p> : null}
+            <audio
+              ref={ringRef}
+              onEnded={() => setRinging(false)}
+              style={{ display: "none" }}
+              preload="auto"
+            />
+          </div>
+
+          <div className="pom-panel">
+            <p className="pom-stat">
+              今天完成<b>{today.count}</b>顆蕃茄，累積<b>{today.minutes}</b>分鐘。
+            </p>
+
+            <div className="pom-week">
+              {week.map((d) => (
+                <div className="pom-day" key={d.label}>
+                  <div
+                    className={`pom-bar${d.minutes ? "" : " zero"}`}
+                    style={{ height: `${d.minutes ? Math.max(4, (d.minutes / peak) * 100) : 2}%` }}
+                    title={`${d.label} ${d.minutes} 分鐘`}
+                  />
+                </div>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 18 }}>
+              {week.map((d) => (
+                <div className="pom-daylabel" style={{ flex: 1 }} key={`l-${d.label}`}>
+                  {d.label}
+                </div>
+              ))}
+            </div>
+
+            <h2 className="pom-h">
+              {panel === "log"
+                ? "最近紀錄"
+                : panel === "full"
+                ? "完整紀錄"
+                : panel === "set"
+                ? "設定"
+                : panel === "rep"
+                ? "報表"
+                : "匯出與匯入"}
+            </h2>
+
+            {panel === "log" ? (
+              recent.length === 0 ? (
+                <p className="pom-empty">還沒有紀錄。按下開始之後，每完成一輪就會寫進這裡。</p>
+              ) : (
+                <div>
+                  {recent.map((g) => (
+                    <div key={g.key}>
+                      <p className="pom-date">
+                        {new Date(g.at).getMonth() + 1} 月 {new Date(g.at).getDate()} 日
+                      </p>
+                      <ul className="pom-log">
+                        {g.rows.map((r) => (
+                          <li key={r.id}>
+                            <span className={`pom-dot${r.mode === "focus" ? "" : " rest"}`} />
+                            <span className="pom-when">{clock(r.at)}</span>
+                            <span className="pom-what">{r.task || LABEL[r.mode]}</span>
+                            <span className="pom-mins">{r.minutes} 分</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+                  {log.length > 12 ? (
+                    <p style={{ margin: "14px 0 0" }}>
+                      <button type="button" className="pom-link" onClick={() => setPanel("full")}>
+                        看完整紀錄，共 {log.length} 筆
+                      </button>
+                    </p>
+                  ) : null}
+                </div>
+              )
+            ) : panel === "full" ? (
+              <div>
+                <div className="pom-scroll">
+                  {fullLog.map((g) => (
+                    <div key={g.key}>
+                      <p className="pom-date">
+                        {new Date(g.at).getMonth() + 1} 月 {new Date(g.at).getDate()} 日
+                      </p>
+                      <ul className="pom-log">
+                        {g.rows.map((r) => (
+                          <li key={r.id}>
+                            <span className={`pom-dot${r.mode === "focus" ? "" : " rest"}`} />
+                            <span className="pom-when">{clock(r.at)}</span>
+                            <span className="pom-what">{r.task || LABEL[r.mode]}</span>
+                            <span className="pom-mins">{r.minutes} 分</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+                </div>
+                {log.length > 200 ? (
+                  <p className="pom-empty" style={{ marginTop: 12 }}>
+                    這裡列出最近 200 筆，更早的紀錄可以從匯出取得。
+                  </p>
+                ) : null}
+                <p style={{ margin: "14px 0 0" }}>
+                  <button type="button" className="pom-link" onClick={() => setPanel("log")}>
+                    回到最近紀錄
+                  </button>
+                </p>
+              </div>
+            ) : panel === "set" ? (
+              <div>
+                <h3 className="pom-h">時間長度</h3>
+                <div className="pom-set">
+                  {[
+                    ["focus", "專注（分鐘）", 1, 180],
+                    ["short", "短休息（分鐘）", 1, 60],
+                    ["long", "長休息（分鐘）", 1, 90],
+                    ["cycle", "幾輪專注後長休息", 1, 12],
+                  ].map(([k, label, min, max]) => (
+                    <div key={k}>
+                      <label htmlFor={`set-${k}`}>{label}</label>
+                      <input
+                        id={`set-${k}`}
+                        type="number"
+                        min={min}
+                        max={max}
+                        value={settings[k]}
+                        onChange={(e) => {
+                          const v = Math.max(min, Math.min(max, Number(e.target.value) || min));
+                          const ns = { ...settings, [k]: v };
+                          setSettings(ns);
+                          if (!running && k === mode) setRemaining(v * 60);
+                        }}
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{ marginTop: 20, borderTop: "1px solid var(--line)", paddingTop: 16 }}>
+                  <h3 className="pom-h">提示音</h3>
+                  <div
+                    style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}
+                  >
+                    <label className="pom-file">
+                      從硬碟選擇音檔
+                      <input type="file" accept="audio/*" onChange={onPickFile} />
+                    </label>
+                    <button
+                      type="button"
+                      className="pom-btn"
+                      style={{ padding: "8px 18px", fontSize: 13.5 }}
+                      onClick={ringing ? stopRing : playAlert}
+                    >
+                      {ringing ? "停止" : "試聽"}
+                    </button>
+                    {sound ? (
+                      <button type="button" className="pom-link" onClick={clearSound}>
+                        改回內建音
+                      </button>
+                    ) : null}
+                  </div>
+                  <label className="pom-check">
+                    <input
+                      type="checkbox"
+                      checked={!!settings.repeat}
+                      onChange={(e) => setSettings({ ...settings, repeat: e.target.checked })}
+                    />
+                    重複播放，直到按下停止
+                  </label>
+                  <p className="pom-sound">
+                    {sound ? `目前使用「${sound.name}」。` : "目前使用內建的兩聲短提示。"}
+                    {soundNote ? ` ${soundNote}` : ""}
+                  </p>
+                </div>
+
+                <div style={{ marginTop: 18 }}>
+                  {confirming ? (
+                    <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                      <span style={{ fontSize: 12.5, color: "var(--muted)" }}>清除全部紀錄？</span>
+                      <button
+                        type="button"
+                        className="pom-btn"
+                        onClick={() => {
+                          setLog([]);
+                          setConfirming(false);
+                        }}
+                      >
+                        清除
+                      </button>
+                      <button type="button" className="pom-link" onClick={() => setConfirming(false)}>
+                        取消
+                      </button>
+                    </div>
+                  ) : (
+                    <button type="button" className="pom-link" onClick={() => setConfirming(true)}>
+                      清除全部紀錄
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : panel === "rep" ? (
+              <div>
+                <div className="pom-seg">
+                  {[
+                    ["week", "週"],
+                    ["month", "月"],
+                    ["all", "全部"],
+                  ].map(([v, l]) => (
+                    <button
+                      key={v}
+                      type="button"
+                      className={`pom-tab${repView === v ? " on" : ""}`}
+                      onClick={() => {
+                        setRepView(v);
+                        setOffset(0);
+                      }}
+                    >
+                      {l}
+                    </button>
+                  ))}
+                </div>
+
+                {repView === "week" ? (
+                  <div>
+                    <div className="pom-nav">
+                      <button
+                        type="button"
+                        className="pom-link"
+                        onClick={() => setOffset(offset + 1)}
+                      >
+                        前一週
+                      </button>
+                      <span className="pom-navlabel">{rep.label}</span>
+                      <button
+                        type="button"
+                        className="pom-link"
+                        style={{ opacity: offset === 0 ? 0.3 : 1 }}
+                        disabled={offset === 0}
+                        onClick={() => setOffset(Math.max(0, offset - 1))}
+                      >
+                        後一週
+                      </button>
+                    </div>
+                    <div className="pom-wk">
+                      {rep.days.map((x, i) => (
+                        <div className="pom-day" key={`w${i}`}>
+                          <div
+                            className={`pom-bar${x.minutes ? "" : " zero"}`}
+                            style={{
+                              height: `${
+                                x.minutes ? Math.max(4, (x.minutes / repPeak) * 100) : 2
+                              }%`,
+                            }}
+                            title={`${x.d.getMonth() + 1}/${x.d.getDate()} ${x.minutes} 分鐘`}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                    <div className="pom-wklab">
+                      {rep.days.map((x, i) => (
+                        <div key={`wl${i}`}>
+                          {WD[i]}
+                          <b>{x.minutes || "—"}</b>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="pom-stat" style={{ marginTop: 18 }}>
+                      完成<b>{rep.count}</b>顆蕃茄，累積<b>{rep.minutes}</b>分鐘。
+                    </p>
+                    <p className="pom-empty">
+                      前一週是 {repPrev.minutes} 分鐘，{diffWord}。
+                    </p>
+                  </div>
+                ) : repView === "month" ? (
+                  <div>
+                    <div className="pom-nav">
+                      <button
+                        type="button"
+                        className="pom-link"
+                        onClick={() => setOffset(offset + 1)}
+                      >
+                        前一月
+                      </button>
+                      <span className="pom-navlabel">{rep.label}</span>
+                      <button
+                        type="button"
+                        className="pom-link"
+                        style={{ opacity: offset === 0 ? 0.3 : 1 }}
+                        disabled={offset === 0}
+                        onClick={() => setOffset(Math.max(0, offset - 1))}
+                      >
+                        後一月
+                      </button>
+                    </div>
+                    <div className="pom-cal">
+                      {WD.map((w) => (
+                        <div className="pom-calhead" key={`h${w}`}>
+                          {w}
+                        </div>
+                      ))}
+                      {rep.cells.map((c, i) =>
+                        c === null ? (
+                          <div className="pom-cell blank" key={`p${i}`} />
+                        ) : (
+                          <div
+                            key={`d${c.day}`}
+                            className={`pom-cell${c.minutes ? " hit" : ""}`}
+                            style={
+                              c.minutes
+                                ? {
+                                    backgroundColor: `rgba(190,58,43,${(
+                                      0.3 +
+                                      0.65 * (c.minutes / repPeak)
+                                    ).toFixed(2)})`,
+                                  }
+                                : undefined
+                            }
+                            title={`${c.day} 日 ${c.minutes} 分鐘`}
+                          >
+                            {c.day}
+                          </div>
+                        )
+                      )}
+                    </div>
+                    <p className="pom-stat" style={{ marginTop: 18 }}>
+                      完成<b>{rep.count}</b>顆蕃茄，累積<b>{rep.minutes}</b>分鐘。
+                    </p>
+                    <p className="pom-empty">
+                      有 {rep.active} 天動筆
+                      {rep.active
+                        ? `，動筆的日子平均 ${Math.round(rep.minutes / rep.active)} 分鐘`
+                        : ""}
+                      。前一個月是 {repPrev.minutes} 分鐘，{diffWord}。
+                    </p>
+                  </div>
+                ) : allReport.count === 0 ? (
+                  <p className="pom-empty">還沒有專注紀錄，完成第一輪之後這裡就會有內容。</p>
+                ) : (
+                  <div>
+                    <p className="pom-stat">
+                      總共完成<b>{allReport.count}</b>顆蕃茄，累積
+                      <b>{Math.floor(allReport.minutes / 60)}</b>小時
+                      <b>{allReport.minutes % 60}</b>分鐘。
+                    </p>
+                    <p className="pom-empty" style={{ marginBottom: 18 }}>
+                      有 {allReport.activeDays} 天動筆，平均每天{" "}
+                      {Math.round(allReport.minutes / allReport.activeDays)} 分鐘。最多的一天是
+                      {fmtKey(allReport.bestKey)}的 {allReport.bestMin} 分鐘。第一筆紀錄在
+                      {new Date(allReport.first).getMonth() + 1} 月
+                      {new Date(allReport.first).getDate()} 日。
+                    </p>
+
+                    <h3 className="pom-h">逐月</h3>
+                    {allReport.months.map((m) => (
+                      <div className="pom-row" key={m.label}>
+                        <span className="pom-rowname">{m.label}</span>
+                        <span className="pom-rowbar">
+                          <i
+                            style={{
+                              width: `${
+                                (m.minutes /
+                                  Math.max(1, ...allReport.months.map((x) => x.minutes))) *
+                                100
+                              }%`,
+                            }}
+                          />
+                        </span>
+                        <span className="pom-rowval">{m.minutes} 分</span>
+                      </div>
+                    ))}
+
+                    <h3 className="pom-h" style={{ marginTop: 20 }}>
+                      依任務
+                    </h3>
+                    {allReport.tasks.slice(0, 12).map((t) => (
+                      <div className="pom-row" key={t.name}>
+                        <span className="pom-rowname" title={t.name}>
+                          {t.name}
+                        </span>
+                        <span className="pom-rowbar">
+                          <i
+                            style={{
+                              width: `${
+                                (t.minutes /
+                                  Math.max(1, ...allReport.tasks.map((x) => x.minutes))) *
+                                100
+                              }%`,
+                            }}
+                          />
+                        </span>
+                        <span className="pom-rowval">{t.minutes} 分</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div>
+                <p className="pom-empty" style={{ marginBottom: 12 }}>
+                  目前共 {log.length} 筆。下方是逗號分隔格式，存成 CSV 之後可以直接用試算表打開。
+                </p>
+                <textarea
+                  className="pom-out"
+                  readOnly
+                  value={csv}
+                  onFocus={(e) => e.target.select()}
+                />
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 10,
+                    marginTop: 12,
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <button type="button" className="pom-btn" onClick={download}>
+                    下載檔案
+                  </button>
+                  <button type="button" className="pom-btn" onClick={copy}>
+                    複製全部
+                  </button>
+                  {hint ? (
+                    <span style={{ fontSize: 12, color: "var(--muted)" }}>{hint}</span>
+                  ) : null}
+                </div>
+
+                <div style={{ marginTop: 24, borderTop: "1px solid var(--line)", paddingTop: 16 }}>
+                  <h3 className="pom-h">匯入</h3>
+                  <p className="pom-empty" style={{ marginBottom: 12 }}>
+                    接受和上面同樣格式的內容。選一個 CSV 檔，或把文字直接貼進下面的框。
+                  </p>
+                  <label className="pom-file" style={{ marginBottom: 12 }}>
+                    從硬碟選擇 CSV
+                    <input type="file" accept=".csv,text/csv,text/plain" onChange={onPickCSV} />
+                  </label>
+                  <textarea
+                    className="pom-out"
+                    style={{ height: 130, marginTop: 12 }}
+                    value={impText}
+                    placeholder="日期,時間,類型,任務,分鐘"
+                    onChange={(e) => readImport(e.target.value)}
+                  />
+                  {impNote ? <p className="pom-sound">{impNote}</p> : null}
+                  {impParsed && impParsed.records.length ? (
+                    <div
+                      style={{
+                        display: "flex",
+                        gap: 10,
+                        marginTop: 12,
+                        alignItems: "center",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <button
+                        type="button"
+                        className="pom-btn"
+                        onClick={() => applyImport(false)}
+                      >
+                        合併加入
+                      </button>
+                      {impConfirm ? (
+                        <>
+                          <span style={{ fontSize: 12.5, color: "var(--signal)" }}>
+                            現有的 {log.length} 筆會被全部蓋掉，確定嗎？
+                          </span>
+                          <button
+                            type="button"
+                            className="pom-btn ring"
+                            onClick={() => applyImport(true)}
+                          >
+                            確定取代
+                          </button>
+                          <button
+                            type="button"
+                            className="pom-link"
+                            onClick={() => setImpConfirm(false)}
+                          >
+                            取消
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          className="pom-link"
+                          onClick={() => setImpConfirm(true)}
+                        >
+                          全部取代
+                        </button>
+                      )}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            )}
+
+            <div className="pom-foot">
+              <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className="pom-link"
+                  onClick={() => {
+                    setOffset(0);
+                    setPanel(panel === "rep" ? "log" : "rep");
+                  }}
+                >
+                  {panel === "rep" ? "回到紀錄" : "報表"}
+                </button>
+                <button
+                  type="button"
+                  className="pom-link"
+                  onClick={() => setPanel(panel === "set" ? "log" : "set")}
+                >
+                  {panel === "set" ? "回到紀錄" : "設定"}
+                </button>
+                <button
+                  type="button"
+                  className="pom-link"
+                  onClick={() => {
+                    setHint("");
+                    setPanel(panel === "out" ? "log" : "out");
+                  }}
+                >
+                  {panel === "out" ? "回到紀錄" : "匯出與匯入"}
+                </button>
+              </div>
+              <span style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                {ready ? "已同步" : "讀取中"}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Pomodoro />);
+
+</script>
+</body>
+</html>
