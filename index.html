@@ -8,6 +8,7 @@
   html, body { margin: 0; padding: 0; height: 100%; background: #D6DFD7; }
   #root { min-height: 100%; }
 </style>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone@7/babel.min.js" crossorigin></script>
@@ -18,8 +19,7 @@
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
 // 原本的版本跑在 Claude 的畫布裡，用的是那裡才有的 window.storage。
-// 瀏覽器沒有這個東西，所以在這裡用瀏覽器內建的 localStorage 補上同名的三個方法，
-// 底下的程式碼就完全不必改寫。資料只留在這台電腦的這個瀏覽器裡。
+// 這裡用瀏覽器內建的 localStorage 補上同名的方法，底下的程式碼就不必改寫。
 const storage = {
   async get(key) {
     const value = localStorage.getItem(key);
@@ -36,6 +36,144 @@ const storage = {
   },
 };
 window.storage = storage;
+
+// ===== Google 雲端硬碟同步 =====
+// 全部在瀏覽器裡完成，沒有任何伺服器經手。紀錄寫進 Drive 的「應用程式專屬資料夾」，
+// 那是一塊隱藏區域，不會混進你平常的檔案列表，移除授權時會跟著消失。
+const CLIENT_ID_KEY = "pomodoro:clientId";
+const DRIVE_FLAG = "pomodoro:drive";
+const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.appdata";
+const DRIVE_FILE = "pomodoro.json";
+
+let tokenClient = null;
+let accessToken = "";
+let tokenExpiry = 0;
+
+function getClientId() {
+  return (localStorage.getItem(CLIENT_ID_KEY) || "").trim();
+}
+
+function saveClientId(v) {
+  localStorage.setItem(CLIENT_ID_KEY, String(v || "").trim());
+  tokenClient = null;
+  accessToken = "";
+  tokenExpiry = 0;
+}
+
+function gisReady() {
+  return !!(window.google && window.google.accounts && window.google.accounts.oauth2);
+}
+
+function ensureTokenClient() {
+  if (tokenClient) return tokenClient;
+  if (!gisReady()) throw new Error("Google 的授權元件還沒載入完成，稍後再試一次。");
+  const id = getClientId();
+  if (!id) throw new Error("還沒填入用戶端 ID。");
+  tokenClient = window.google.accounts.oauth2.initTokenClient({
+    client_id: id,
+    scope: DRIVE_SCOPE,
+    callback: () => {},
+  });
+  return tokenClient;
+}
+
+function requestToken(interactive) {
+  return new Promise((resolve, reject) => {
+    let client;
+    try {
+      client = ensureTokenClient();
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    client.callback = (res) => {
+      if (res && res.access_token) {
+        accessToken = res.access_token;
+        tokenExpiry = Date.now() + (Number(res.expires_in || 3600) - 60) * 1000;
+        resolve(accessToken);
+      } else {
+        reject(new Error("沒有取得授權。"));
+      }
+    };
+    client.error_callback = () => reject(new Error("授權視窗被關閉或被瀏覽器擋下。"));
+    try {
+      client.requestAccessToken({ prompt: interactive ? "consent" : "" });
+    } catch (e) {
+      reject(new Error("無法開啟授權視窗。"));
+    }
+  });
+}
+
+async function driveFetch(url, opts) {
+  const o = opts || {};
+  const headers = Object.assign({}, o.headers || {}, { Authorization: "Bearer " + accessToken });
+  const res = await fetch(url, Object.assign({}, o, { headers }));
+  if (res.status === 401 || res.status === 403) {
+    accessToken = "";
+    tokenExpiry = 0;
+    throw new Error("授權已經失效，需要重新連接一次。");
+  }
+  if (!res.ok) throw new Error("雲端硬碟回應錯誤（" + res.status + "）。");
+  return res;
+}
+
+async function driveFind() {
+  const q = encodeURIComponent("name='" + DRIVE_FILE + "' and trashed=false");
+  const res = await driveFetch(
+    "https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=" +
+      q +
+      "&fields=files(id,modifiedTime)"
+  );
+  const j = await res.json();
+  return j && j.files && j.files.length ? j.files[0] : null;
+}
+
+async function driveRead(id) {
+  const res = await driveFetch(
+    "https://www.googleapis.com/drive/v3/files/" + encodeURIComponent(id) + "?alt=media"
+  );
+  return res.json();
+}
+
+async function driveWrite(id, payload) {
+  const body = JSON.stringify(payload);
+  if (id) {
+    await driveFetch(
+      "https://www.googleapis.com/upload/drive/v3/files/" + encodeURIComponent(id) + "?uploadType=media",
+      { method: "PATCH", headers: { "Content-Type": "application/json" }, body }
+    );
+    return id;
+  }
+  const boundary = "pomodoro" + Date.now();
+  const meta = JSON.stringify({ name: DRIVE_FILE, parents: ["appDataFolder"] });
+  const multipart =
+    "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + meta +
+    "\r\n--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + body +
+    "\r\n--" + boundary + "--";
+  const res = await driveFetch(
+    "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id",
+    {
+      method: "POST",
+      headers: { "Content-Type": "multipart/related; boundary=" + boundary },
+      body: multipart,
+    }
+  );
+  const j = await res.json();
+  return j && j.id ? j.id : null;
+}
+
+function mergeLogs(a, b) {
+  const m = new Map();
+  [].concat(a || [], b || []).forEach((r) => {
+    if (!r || !ORDER.includes(r.mode) || !r.at) return;
+    const k = r.mode + "@" + r.at;
+    const cur = m.get(k);
+    if (!cur || String(r.task || "").length > String(cur.task || "").length) m.set(k, r);
+  });
+  return Array.from(m.values())
+    .sort((x, y) => y.at - x.at)
+    .slice(0, 400);
+}
 
 const KEY = "pomodoro:data";
 const SOUND_KEY = "pomodoro:sound";
@@ -370,6 +508,83 @@ function Pomodoro() {
 
   const leftRef = useRef(remaining);
   leftRef.current = remaining;
+
+  const [clientId, setClientIdState] = useState(getClientId());
+  const [idDraft, setIdDraft] = useState("");
+  const [driveOn, setDriveOn] = useState(localStorage.getItem(DRIVE_FLAG) === "on");
+  const [driveNote, setDriveNote] = useState("");
+  const [driveBusy, setDriveBusy] = useState(false);
+  const logRef = useRef(log);
+  logRef.current = log;
+  const syncedOnce = useRef(false);
+
+  const syncDrive = useCallback(async (interactive) => {
+    setDriveBusy(true);
+    setDriveNote(interactive ? "正在開啟授權視窗……" : "同步中……");
+    try {
+      if (!accessToken || Date.now() > tokenExpiry) await requestToken(!!interactive);
+      const found = await driveFind();
+      let remote = null;
+      if (found) {
+        try {
+          remote = await driveRead(found.id);
+        } catch (e) {
+          remote = null;
+        }
+      }
+      const merged = mergeLogs(logRef.current, remote && Array.isArray(remote.log) ? remote.log : []);
+      setLog(merged);
+      await driveWrite(found ? found.id : null, { version: 1, savedAt: Date.now(), log: merged });
+      localStorage.setItem(DRIVE_FLAG, "on");
+      setDriveOn(true);
+      setDriveNote("已同步，目前共 " + merged.length + " 筆。");
+    } catch (e) {
+      setDriveNote(String((e && e.message) || e));
+    } finally {
+      setDriveBusy(false);
+    }
+  }, []);
+
+  const disconnectDrive = useCallback(() => {
+    try {
+      if (accessToken && gisReady()) window.google.accounts.oauth2.revoke(accessToken, () => {});
+    } catch (e) {
+      /* 已經失效的授權不需要處理 */
+    }
+    accessToken = "";
+    tokenExpiry = 0;
+    localStorage.setItem(DRIVE_FLAG, "off");
+    setDriveOn(false);
+    setDriveNote("已停止同步。這台裝置上的紀錄不受影響。");
+  }, []);
+
+  useEffect(() => {
+    if (!ready || !driveOn || !clientId || syncedOnce.current) return undefined;
+    let alive = true;
+    let tries = 0;
+    const id = setInterval(() => {
+      if (!alive) return;
+      if (gisReady()) {
+        clearInterval(id);
+        syncedOnce.current = true;
+        syncDrive(false);
+      } else if (tries > 40) {
+        clearInterval(id);
+        setDriveNote("Google 的授權元件載入失敗，稍後可以手動再同步一次。");
+      }
+      tries += 1;
+    }, 250);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [ready, driveOn, clientId, syncDrive]);
+
+  useEffect(() => {
+    if (!ready || !driveOn || !accessToken || !syncedOnce.current) return undefined;
+    const t = setTimeout(() => syncDrive(false), 4000);
+    return () => clearTimeout(t);
+  }, [log.length, ready, driveOn, syncDrive]);
 
   useEffect(() => {
     let alive = true;
@@ -1120,6 +1335,76 @@ function Pomodoro() {
                   <p className="pom-sound">
                     {sound ? `目前使用「${sound.name}」。` : "目前使用內建的兩聲短提示。"}
                     {soundNote ? ` ${soundNote}` : ""}
+                  </p>
+                </div>
+
+
+                <div style={{ marginTop: 20, borderTop: "1px solid var(--line)", paddingTop: 16 }}>
+                  <h3 className="pom-h">雲端同步</h3>
+                  {clientId ? (
+                    <div
+                      style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}
+                    >
+                      <button
+                        type="button"
+                        className="pom-btn"
+                        style={{ padding: "8px 18px", fontSize: 13.5 }}
+                        disabled={driveBusy}
+                        onClick={() => syncDrive(!driveOn)}
+                      >
+                        {driveOn ? "立即同步" : "連接 Google 雲端硬碟"}
+                      </button>
+                      {driveOn ? (
+                        <button type="button" className="pom-link" onClick={disconnectDrive}>
+                          停止同步
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="pom-link"
+                        onClick={() => {
+                          saveClientId("");
+                          setClientIdState("");
+                          setDriveOn(false);
+                          setDriveNote("");
+                        }}
+                      >
+                        更換用戶端 ID
+                      </button>
+                    </div>
+                  ) : (
+                    <div>
+                      <p className="pom-sound" style={{ marginTop: 0 }}>
+                        貼上 Google Cloud 那邊建立的用戶端 ID，格式像
+                        123456789-abcdefg.apps.googleusercontent.com。只會存在這台裝置裡。
+                      </p>
+                      <input
+                        className="pom-task"
+                        style={{ maxWidth: "none", textAlign: "left", margin: "8px 0 12px" }}
+                        placeholder="用戶端 ID"
+                        value={idDraft}
+                        onChange={(e) => setIdDraft(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="pom-btn"
+                        style={{ padding: "8px 18px", fontSize: 13.5 }}
+                        onClick={() => {
+                          saveClientId(idDraft);
+                          setClientIdState(getClientId());
+                          setIdDraft("");
+                          setDriveNote("");
+                        }}
+                      >
+                        儲存
+                      </button>
+                    </div>
+                  )}
+                  <p className="pom-sound">
+                    {driveOn
+                      ? "紀錄會存進你自己的雲端硬碟。其他裝置打開同一個網址、連接同一個帳號，就會看到同一份。"
+                      : "還沒連接，紀錄只留在這台裝置的瀏覽器裡。"}
+                    {driveNote ? " " + driveNote : ""}
                   </p>
                 </div>
 
